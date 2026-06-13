@@ -1,0 +1,18 @@
+# Workspace of probe-rs flash-algorithm loaders for HiSilicon RISC-V SoCs.
+#
+# Each member is a `#![no_std]` riscv32imc blob that probe-rs uploads to target
+# RAM to erase/program on-chip flash. Add a new member here when adding support
+# for another chip family (e.g. `bs2x`).
+[workspace]
+resolver = "2"
+members = ["ws63"]
+
+# Release profile shared by all flash-algorithm members: small, fully optimized,
+# single codegen unit + fat LTO so the extracted blob is compact and the routine
+# entry points are stable.
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = "fat"
+opt-level = "s"
+overflow-checks = false
