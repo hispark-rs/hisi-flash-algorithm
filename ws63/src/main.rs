@@ -34,7 +34,7 @@ core::arch::global_asm!(
 // ---- SFC v150 register map (base 0x4800_0000) ----
 const SFC_BASE: u32 = 0x4800_0000;
 const CMD_CONFIG: u32 = SFC_BASE + 0x300; // [0]start [1]sel_cs [3]addr_en [7]data_en
-// [8]rw(0=wr,1=rd) [9:14]data_cnt=len-1 [17:19]if_type
+                                          // [8]rw(0=wr,1=rd) [9:14]data_cnt=len-1 [17:19]if_type
 const CMD_INS: u32 = SFC_BASE + 0x308; // [7:0] opcode
 const CMD_ADDR: u32 = SFC_BASE + 0x30C; // flash chip offset
 const CMD_DATABUF: u32 = SFC_BASE + 0x400; // 16 x u32
@@ -47,7 +47,11 @@ const OP_WREN: u32 = 0x06;
 const OP_RDSR: u32 = 0x05;
 const OP_SE_4K: u32 = 0x20; // 4 KiB sector erase
 const OP_PP: u32 = 0x02; // page program
-const OP_WRSR: u32 = 0x01; // write status register (used to clear block-protect)
+const OP_WRSR: u32 = 0x01; // write status register 1
+const OP_RDSR2: u32 = 0x35; // read status register 2
+const OP_WRSR2: u32 = 0x31; // write status register 2
+const OP_RDSR3: u32 = 0x15; // read status register 3
+const OP_WRSR3: u32 = 0x11; // write status register 3
 
 const RW_WRITE: u32 = 0;
 const RW_READ: u32 = 1;
@@ -118,7 +122,39 @@ fn wait_ready() -> Result<(), ErrorCode> {
     Err(ErrorCode::new(0x57630001).unwrap()) // WIP wait timeout
 }
 
-struct Ws63Algo;
+/// Read a flash status register via the given RDSR opcode. Returns 1 byte.
+fn read_status_register_op(rdsr_op: u32) -> u8 {
+    wr(CMD_INS, rdsr_op);
+    wr(CMD_CONFIG, cmd_config(false, true, RW_READ, 0)); // read 1 status byte
+    wait_cmd_done();
+    (rd(CMD_DATABUF) & 0xFF) as u8
+}
+
+/// Write a flash status register via the given WRSR opcode. Requires WREN first.
+fn write_status_register_op(wrsr_op: u32, val: u8) {
+    write_enable();
+    wr(CMD_DATABUF, val as u32);
+    wr(CMD_INS, wrsr_op);
+    wr(CMD_CONFIG, cmd_config(false, true, RW_WRITE, 0)); // write 1 status byte
+    wait_cmd_done();
+    let _ = wait_ready();
+}
+
+/// GD25Q32 status register values expected by flashboot's `sfc_port_fix_sr()`.
+/// SR1: BP0..BP2 (bits 2..4) = 0b111 = block protect. mask 0x9C, valid 0x1C.
+/// SR2: QE bit1=0, SUS bits clear. mask 0x43, valid 0x02.
+/// SR3: bit5=1. mask 0x61, valid 0x20.
+/// flashboot checks all three AFTER `uapi_sfc_init`, but `uapi_sfc_init` itself
+/// can fail if the flash is in a bad state. We restore all three in Drop.
+const EXPECTED_SR1: u8 = 0x1C;
+const EXPECTED_SR2: u8 = 0x02;
+const EXPECTED_SR3: u8 = 0x20;
+
+struct Ws63Algo {
+    saved_sr1: u8,
+    saved_sr2: u8,
+    saved_sr3: u8,
+}
 
 algorithm!(Ws63Algo, {
     device_name: "ws63",
@@ -128,7 +164,7 @@ algorithm!(Ws63Algo, {
     page_size: 0x100,
     empty_value: 0xFF,
     program_time_out: 1000,
-    erase_time_out: 5000,
+    erase_time_out: 30000,
     sectors: [{
         size: 0x1000,
         address: 0x0,
@@ -140,17 +176,21 @@ impl FlashAlgorithm for Ws63Algo {
         // The SFC is left as configured by the boot ROM / flashboot (XIP bus mode);
         // the register/command path used below operates alongside it.
         //
-        // Clear the flash chip's block-protect bits (status register BP0..BP2). On
-        // this board (GD25Q32) they are set at power-on (RDSR=0x1e) and the chip
-        // silently rejects every erase/program until they are cleared. Hardware-
-        // verified: WREN + WRSR(status=0x00) is what unblocks SE/PP.
-        write_enable();
-        wr(CMD_DATABUF, 0x00); // status register value = 0 (BP cleared)
-        wr(CMD_INS, OP_WRSR);
-        wr(CMD_CONFIG, cmd_config(false, true, RW_WRITE, 0)); // write 1 status byte
-        wait_cmd_done();
-        wait_ready()?;
-        Ok(Self)
+        // Save the flash status register, then clear block-protect bits (BP0..BP2)
+        // so erase/program will succeed. On this board (GD25Q32) the BP bits are
+        // set at power-on (RDSR=0x1C or 0x1E) and the chip silently rejects every
+        // erase/program until they are cleared. We restore the original SR in
+        // Drop so flashboot's `sfc_port_fix_sr()` doesn't trip on SR=0x00.
+        let saved_sr1 = read_status_register_op(OP_RDSR);
+        let saved_sr2 = read_status_register_op(OP_RDSR2);
+        let saved_sr3 = read_status_register_op(OP_RDSR3);
+        // Clear block-protect in SR1 so erase/program will succeed.
+        write_status_register_op(OP_WRSR, 0x00);
+        Ok(Self {
+            saved_sr1,
+            saved_sr2,
+            saved_sr3,
+        })
     }
 
     fn erase_sector(&mut self, address: u32) -> Result<(), ErrorCode> {
@@ -193,5 +233,43 @@ impl FlashAlgorithm for Ws63Algo {
             off += chunk.len() as u32;
         }
         Ok(())
+    }
+}
+
+impl Drop for Ws63Algo {
+    fn drop(&mut self) {
+        // Restore the SFC controller and flash chip to a clean state for
+        // flashboot's `uapi_sfc_init()` on the next boot.
+        //
+        // Two things must be restored:
+        // 1. SFC CMD_CONFIG `start` bit must be cleared and the register set to
+        //    idle, or flashboot's SFC command path thinks a transaction is in
+        //    progress and RDID/RDSR never execute → "Flash Init Fail" (0x80001341).
+        // 2. Flash status register BP bits must be restored to their pre-flash
+        //    value (0x1C on GD25Q32). flashboot's `sfc_port_fix_sr()` checks SR
+        //    and rejects SR=0x00 with "SR1[0x0] needs fixing, expect[0x1c]".
+        wait_cmd_done(); // ensure last SFC transaction completed
+        wr(CMD_CONFIG, 0); // force-clear start / sel_cs / all fields
+
+        // Restore all three flash status registers to the values flashboot expects.
+        // GD25Q32 has SR1 (BP bits), SR2 (QE/SUS), SR3 — flashboot checks all three.
+        let sr1 = if self.saved_sr1 != 0 {
+            self.saved_sr1
+        } else {
+            EXPECTED_SR1
+        };
+        let sr2 = if self.saved_sr2 != 0 {
+            self.saved_sr2
+        } else {
+            EXPECTED_SR2
+        };
+        let sr3 = if self.saved_sr3 != 0 {
+            self.saved_sr3
+        } else {
+            EXPECTED_SR3
+        };
+        write_status_register_op(OP_WRSR, sr1);
+        write_status_register_op(OP_WRSR2, sr2);
+        write_status_register_op(OP_WRSR3, sr3);
     }
 }
