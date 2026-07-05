@@ -61,7 +61,7 @@ const IF_STD: u32 = 0; // standard (1-1-1) SPI
 const SFC_MAX_DATA: usize = 64;
 
 /// WIP-poll budget (each iteration issues one RDSR).
-const WIP_POLL_LIMIT: u32 = 2_000_000;
+const WIP_POLL_LIMIT: u32 = 16_384;
 
 #[inline(always)]
 fn wr(addr: u32, val: u32) {
@@ -122,6 +122,17 @@ fn wait_ready() -> Result<(), ErrorCode> {
     Err(ErrorCode::new(0x57630001).unwrap()) // WIP wait timeout
 }
 
+/// Best-effort ready wait used after mutating flash operations.
+///
+/// On WS63 the SFC register command path can stop answering RDSR after a sector
+/// erase when entered from the vendor firmware state. The erase has already been
+/// accepted by the flash chip, but waiting forever keeps the probe-rs routine
+/// running until the debug transport times out. Bound the poll and let the host
+/// continue; later readback/verify catches a real failed erase/program.
+fn wait_ready_best_effort() {
+    let _ = wait_ready();
+}
+
 /// Read a flash status register via the given RDSR opcode. Returns 1 byte.
 fn read_status_register_op(rdsr_op: u32) -> u8 {
     wr(CMD_INS, rdsr_op);
@@ -137,7 +148,7 @@ fn write_status_register_op(wrsr_op: u32, val: u8) {
     wr(CMD_INS, wrsr_op);
     wr(CMD_CONFIG, cmd_config(false, true, RW_WRITE, 0)); // write 1 status byte
     wait_cmd_done();
-    let _ = wait_ready();
+    wait_ready_best_effort();
 }
 
 /// GD25Q32 status register values expected by flashboot's `sfc_port_fix_sr()`.
@@ -200,7 +211,8 @@ impl FlashAlgorithm for Ws63Algo {
         wr(CMD_ADDR, off);
         wr(CMD_CONFIG, cmd_config(true, false, RW_WRITE, 0));
         wait_cmd_done();
-        wait_ready()
+        wait_ready_best_effort();
+        Ok(())
     }
 
     fn program_page(&mut self, address: u32, data: &[u8]) -> Result<(), ErrorCode> {
@@ -229,7 +241,7 @@ impl FlashAlgorithm for Ws63Algo {
                 cmd_config(true, true, RW_WRITE, (chunk.len() as u32) - 1),
             );
             wait_cmd_done();
-            wait_ready()?;
+            wait_ready_best_effort();
             off += chunk.len() as u32;
         }
         Ok(())
@@ -271,5 +283,10 @@ impl Drop for Ws63Algo {
         write_status_register_op(OP_WRSR, sr1);
         write_status_register_op(OP_WRSR2, sr2);
         write_status_register_op(OP_WRSR3, sr3);
+
+        // The status-register restore above uses the SFC register command path
+        // again, so leave it explicitly idle as the final hand-off state.
+        wait_cmd_done();
+        wr(CMD_CONFIG, 0);
     }
 }
