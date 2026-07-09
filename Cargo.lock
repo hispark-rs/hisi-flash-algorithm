@@ -10,7 +10,7 @@ checksum = "2797e1e92b08ee496362cb61e822388e6d1fa5ba1b7e03b21706dcc26a4e305f"
 
 [[package]]
 name = "ws63-flash-algorithm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flash-algorithm",
 ]

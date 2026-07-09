@@ -49,9 +49,12 @@ const OP_SE_4K: u32 = 0x20; // 4 KiB sector erase
 const OP_PP: u32 = 0x02; // page program
 const OP_WRSR: u32 = 0x01; // write status register 1
 const OP_RDSR2: u32 = 0x35; // read status register 2
-const OP_WRSR2: u32 = 0x31; // write status register 2
 const OP_RDSR3: u32 = 0x15; // read status register 3
 const OP_WRSR3: u32 = 0x11; // write status register 3
+
+// SPI-NOR software reset sequence: RSTEN (0x66) followed by RST (0x99).
+const OP_RSTEN: u32 = 0x66; // reset enable
+const OP_RST: u32 = 0x99; // reset memory
 
 const RW_WRITE: u32 = 0;
 const RW_READ: u32 = 1;
@@ -133,6 +136,21 @@ fn wait_ready_best_effort() {
     let _ = wait_ready();
 }
 
+/// Issue a SPI-NOR software reset (RSTEN + RST).
+/// This returns the flash chip to its power-on state, clearing any lingering
+/// command/state left by the erase/program sequence.
+fn flash_software_reset() {
+    // RSTEN must be immediately followed by RST; do not insert WREN or other
+    // commands between them.
+    wr(CMD_INS, OP_RSTEN);
+    wr(CMD_CONFIG, cmd_config(false, false, RW_WRITE, 0));
+    wait_cmd_done();
+    wr(CMD_INS, OP_RST);
+    wr(CMD_CONFIG, cmd_config(false, false, RW_WRITE, 0));
+    wait_cmd_done();
+    let _ = wait_ready();
+}
+
 /// Read a flash status register via the given RDSR opcode. Returns 1 byte.
 fn read_status_register_op(rdsr_op: u32) -> u8 {
     wr(CMD_INS, rdsr_op);
@@ -144,11 +162,23 @@ fn read_status_register_op(rdsr_op: u32) -> u8 {
 /// Write a flash status register via the given WRSR opcode. Requires WREN first.
 fn write_status_register_op(wrsr_op: u32, val: u8) {
     write_enable();
-    wr(CMD_DATABUF, val as u32);
+    wr(CMD_DATABUF + 0, val as u32);
     wr(CMD_INS, wrsr_op);
     wr(CMD_CONFIG, cmd_config(false, true, RW_WRITE, 0)); // write 1 status byte
     wait_cmd_done();
-    wait_ready_best_effort();
+    let _ = wait_ready();
+}
+
+/// Write SR1 and SR2 together via WRSR (0x01). Some GD25Q32 variants only accept
+/// the two-byte form of this command; the single-byte form is ignored.
+fn write_status_registers_sr1_sr2(sr1: u8, sr2: u8) {
+    write_enable();
+    let val = ((sr2 as u32) << 8) | (sr1 as u32);
+    wr(CMD_DATABUF + 0, val);
+    wr(CMD_INS, OP_WRSR);
+    wr(CMD_CONFIG, cmd_config(false, true, RW_WRITE, 1)); // write 2 status bytes
+    wait_cmd_done();
+    let _ = wait_ready();
 }
 
 /// GD25Q32 status register values expected by flashboot's `sfc_port_fix_sr()`.
@@ -253,18 +283,23 @@ impl Drop for Ws63Algo {
         // Restore the SFC controller and flash chip to a clean state for
         // flashboot's `uapi_sfc_init()` on the next boot.
         //
-        // Two things must be restored:
-        // 1. SFC CMD_CONFIG `start` bit must be cleared and the register set to
-        //    idle, or flashboot's SFC command path thinks a transaction is in
-        //    progress and RDID/RDSR never execute → "Flash Init Fail" (0x80001341).
-        // 2. Flash status register BP bits must be restored to their pre-flash
-        //    value (0x1C on GD25Q32). flashboot's `sfc_port_fix_sr()` checks SR
-        //    and rejects SR=0x00 with "SR1[0x0] needs fixing, expect[0x1c]".
+        // If the flash chip is left in an intermediate state (e.g. still completing
+        // the last program, or with a half-finished WRSR transaction), the next
+        // boot's `hal_sfc_get_flash_id()` returns an unrecognized JEDEC ID and
+        // flashboot reports `Flash Init Fail! ret = 0x80001341`.
         wait_cmd_done(); // ensure last SFC transaction completed
         wr(CMD_CONFIG, 0); // force-clear start / sel_cs / all fields
 
+        // Issue a SPI-NOR software reset (RSTEN + RST). This clears the WREN
+        // latch, any busy/half-command state, and the flash's internal command
+        // state machine. RSTEN must be immediately followed by RST.
+        flash_software_reset();
+
         // Restore all three flash status registers to the values flashboot expects.
         // GD25Q32 has SR1 (BP bits), SR2 (QE/SUS), SR3 — flashboot checks all three.
+        // BP bits in SR1 are non-volatile, so a software reset alone cannot restore
+        // them; we must use WRSR. Write SR1+SR2 together (some chips ignore the
+        // single-byte WRSR form), then SR3 separately.
         let sr1 = if self.saved_sr1 != 0 {
             self.saved_sr1
         } else {
@@ -280,13 +315,14 @@ impl Drop for Ws63Algo {
         } else {
             EXPECTED_SR3
         };
-        write_status_register_op(OP_WRSR, sr1);
-        write_status_register_op(OP_WRSR2, sr2);
+        write_status_registers_sr1_sr2(sr1, sr2);
         write_status_register_op(OP_WRSR3, sr3);
 
-        // The status-register restore above uses the SFC register command path
-        // again, so leave it explicitly idle as the final hand-off state.
+        // One more software reset to leave the flash in a clean, idle state; then
+        // idle the SFC command path.
+        flash_software_reset();
         wait_cmd_done();
         wr(CMD_CONFIG, 0);
+        let _ = wait_ready();
     }
 }
