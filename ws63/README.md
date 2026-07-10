@@ -1,9 +1,9 @@
 # ws63-flash-algorithm (probe-rs loader)
 
 A probe-rs flash loader for the HiSilicon WS63 (Hi3863) on-chip SFC NOR flash. It
-drives the Serial Flash Controller (SFC v150) in register/command mode to issue
-standard SPI-NOR commands (WREN / RDSR / 4K sector-erase / page-program), and
-clears the flash chip's block-protect bits on Init.
+drives the Serial Flash Controller (SFC v150) in register/command mode for status
+and erase commands and bus-DMA mode for programming. It clears the flash chip's
+block-protect bits on Init.
 
 > **Status: hardware-verified.** `probe-rs download` erases and programs WS63
 > flash on a real board (GD25Q32). The extracted algorithm is embedded into
@@ -59,14 +59,16 @@ cargo run -p target-gen --manifest-path <probe-rs>/Cargo.toml -- \
 
 `target-gen` fills `instructions` (base64), `pc_init`, `pc_uninit`,
 `pc_program_page`, `pc_erase_sector`, `data_section_offset`, and
-`flash_properties` (range `0x200000..0xa00000`, page `0x100`, 4K sectors). The
+`flash_properties` (range `0x200000..0xa00000`, host batch `0x10000`, 4K sectors). The
 variant's `flash_algorithms: [ws63-sfc]` is already set in the WS63 target.
 
-## What it does (SFC v150 register/command mode)
+## What it does (SFC v150 command + bus-DMA modes)
 
 - SFC base `0x4800_0000`: `cmd_config@0x300`, `cmd_ins@0x308`, `cmd_addr@0x30c`,
   `cmd_databuf[0..15]@0x400` (64 B max per reg-mode transfer).
 - `erase_sector`: WREN → opcode `0x20` (4K) at the flash offset → poll RDSR WIP.
-- `program_page`: for each ≤64 B chunk → WREN → load `cmd_databuf` → opcode `0x02`
-  → poll RDSR WIP.
+- `program_page`: WREN → configure the bus-DMA source/flash address/length → start
+  one hardware transfer. The 64 KiB host batch is passed directly from SRAM to
+  SFC; page-program sequencing is handled by the same DMA engine used by the
+  vendor SDK's `hal_sfc_dma_write()`.
 - CPU XIP address → flash offset via `XIP_BASE = 0x200000`.

@@ -2,7 +2,7 @@
 //!
 //! This is the loader blob that probe-rs uploads to target RAM and calls to erase
 //! and program flash. It drives the WS63 Serial Flash Controller (SFC v150) in
-//! register/command mode to issue standard SPI-NOR commands (WREN/RDSR/SE/PP).
+//! register/command mode for status/erase commands and bus-DMA mode for writes.
 //!
 //! Ground truth: `fbb_ws63` `hal_sfc_v150` (`hal_sfc_v150.c`,
 //! `hal_sfc_v150_regs_def.h`) corroborated by HiSpark Studio's OpenOCD
@@ -39,6 +39,15 @@ const CMD_INS: u32 = SFC_BASE + 0x308; // [7:0] opcode
 const CMD_ADDR: u32 = SFC_BASE + 0x30C; // flash chip offset
 const CMD_DATABUF: u32 = SFC_BASE + 0x400; // 16 x u32
 
+// Bus-mode configuration and its DMA engine. These offsets and the programming
+// sequence match the vendor `hal_sfc_dma_write()` implementation.
+const BUS_CONFIG1: u32 = SFC_BASE + 0x200;
+const BUS_DMA_CTRL: u32 = SFC_BASE + 0x240;
+const BUS_DMA_MEM_SADDR: u32 = SFC_BASE + 0x244;
+const BUS_DMA_FLASH_SADDR: u32 = SFC_BASE + 0x248;
+const BUS_DMA_LEN: u32 = SFC_BASE + 0x24C;
+const BUS_DMA_AHB_CTRL: u32 = SFC_BASE + 0x250;
+
 /// Flash chip offset 0 is mapped to CPU address 0x200000 (SFC bus_base_addr_cs0).
 const XIP_BASE: u32 = 0x0020_0000;
 
@@ -60,11 +69,17 @@ const RW_WRITE: u32 = 0;
 const RW_READ: u32 = 1;
 const IF_STD: u32 = 0; // standard (1-1-1) SPI
 
-/// cmd_databuf is 16 x 4 bytes = 64 bytes max per reg-mode data transfer.
-const SFC_MAX_DATA: usize = 64;
-
 /// WIP-poll budget (each iteration issues one RDSR).
 const WIP_POLL_LIMIT: u32 = 16_384;
+
+/// A 64 KiB bus-DMA write can take substantially longer than one register-mode
+/// command. The host also enforces `program_time_out`; this bound only prevents
+/// a wedged controller from spinning forever on target.
+const DMA_POLL_LIMIT: u32 = 50_000_000;
+
+const BUS_CONFIG1_WRITE_MASK: u32 = (0x7 << 16) | (0x7 << 19) | (0xFF << 22) | (1 << 30);
+const BUS_CONFIG1_STANDARD_PP: u32 = (OP_PP << 22) | (1 << 30);
+const BUS_DMA_CTRL_START_WRITE_CS1: u32 = 1 | (1 << 4);
 
 #[inline(always)]
 fn wr(addr: u32, val: u32) {
@@ -136,6 +151,36 @@ fn wait_ready_best_effort() {
     let _ = wait_ready();
 }
 
+/// Program one host batch through the SFC bus-DMA engine.
+///
+/// Unlike command mode's 64-byte data window, the bus-DMA engine accepts the
+/// whole probe-rs page from SRAM and performs the page-program sequencing in
+/// hardware. This is the same path used by the vendor SDK's
+/// `hal_sfc_dma_write()`.
+fn dma_write(flash_offset: u32, data: &[u8]) -> Result<(), ErrorCode> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    write_enable();
+    wr(BUS_DMA_FLASH_SADDR, flash_offset);
+    wr(BUS_DMA_MEM_SADDR, data.as_ptr() as u32);
+    wr(BUS_DMA_LEN, (data.len() as u32) - 1);
+    wr(BUS_DMA_AHB_CTRL, 0x7); // enable INCR4/INCR8/INCR16 AHB bursts
+    wr(BUS_DMA_CTRL, BUS_DMA_CTRL_START_WRITE_CS1);
+
+    wait_dma_done()
+}
+
+fn wait_dma_done() -> Result<(), ErrorCode> {
+    for _ in 0..DMA_POLL_LIMIT {
+        if rd(BUS_DMA_CTRL) & 1 == 0 {
+            return Ok(());
+        }
+    }
+    Err(ErrorCode::new(0x57630002).unwrap())
+}
+
 /// Issue a SPI-NOR software reset (RSTEN + RST).
 /// This returns the flash chip to its power-on state, clearing any lingering
 /// command/state left by the erase/program sequence.
@@ -195,6 +240,8 @@ struct Ws63Algo {
     saved_sr1: u8,
     saved_sr2: u8,
     saved_sr3: u8,
+    saved_bus_config1: u32,
+    saved_bus_dma_ahb_ctrl: u32,
 }
 
 algorithm!(Ws63Algo, {
@@ -202,9 +249,14 @@ algorithm!(Ws63Algo, {
     device_type: DeviceType::Onchip,
     flash_address: 0x200000,
     flash_size: 0x800000,
-    page_size: 0x100,
+    // Host-side transfer batch. The algorithm still emits independent <=64-byte
+    // SFC page-program commands, so a 64 KiB batch never crosses a hardware page
+    // within one command. probe-rs places the buffers in the 576 KiB SRAM region;
+    // this reduces debug run/halt round trips from about 1,100 to five for a
+    // typical 282 KiB RF image.
+    page_size: 0x10000,
     empty_value: 0xFF,
-    program_time_out: 1000,
+    program_time_out: 30000,
     erase_time_out: 30000,
     sectors: [{
         size: 0x1000,
@@ -225,12 +277,23 @@ impl FlashAlgorithm for Ws63Algo {
         let saved_sr1 = read_status_register_op(OP_RDSR);
         let saved_sr2 = read_status_register_op(OP_RDSR2);
         let saved_sr3 = read_status_register_op(OP_RDSR3);
+        let saved_bus_config1 = rd(BUS_CONFIG1);
+        let saved_bus_dma_ahb_ctrl = rd(BUS_DMA_AHB_CTRL);
+
+        // Bus-DMA uses the write operation configured in bus_config1. Do not
+        // rely on the previously-running firmware to have left this as 0x02.
+        wr(
+            BUS_CONFIG1,
+            (saved_bus_config1 & !BUS_CONFIG1_WRITE_MASK) | BUS_CONFIG1_STANDARD_PP,
+        );
         // Clear block-protect in SR1 so erase/program will succeed.
         write_status_register_op(OP_WRSR, 0x00);
         Ok(Self {
             saved_sr1,
             saved_sr2,
             saved_sr3,
+            saved_bus_config1,
+            saved_bus_dma_ahb_ctrl,
         })
     }
 
@@ -246,35 +309,7 @@ impl FlashAlgorithm for Ws63Algo {
     }
 
     fn program_page(&mut self, address: u32, data: &[u8]) -> Result<(), ErrorCode> {
-        let mut off = address.wrapping_sub(XIP_BASE);
-        for chunk in data.chunks(SFC_MAX_DATA) {
-            write_enable();
-            // Pack bytes into cmd_databuf words (little-endian); pad the tail word
-            // with 0xFF — `data_cnt` bounds the actual byte count, so padding is
-            // never programmed.
-            let words = chunk.len().div_ceil(4);
-            for w in 0..words {
-                let mut v = 0xFFFF_FFFFu32;
-                for b in 0..4 {
-                    let idx = w * 4 + b;
-                    if idx < chunk.len() {
-                        let shift = (b * 8) as u32;
-                        v = (v & !(0xFFu32 << shift)) | ((chunk[idx] as u32) << shift);
-                    }
-                }
-                wr(CMD_DATABUF + (w as u32) * 4, v);
-            }
-            wr(CMD_INS, OP_PP);
-            wr(CMD_ADDR, off);
-            wr(
-                CMD_CONFIG,
-                cmd_config(true, true, RW_WRITE, (chunk.len() as u32) - 1),
-            );
-            wait_cmd_done();
-            wait_ready_best_effort();
-            off += chunk.len() as u32;
-        }
-        Ok(())
+        dma_write(address.wrapping_sub(XIP_BASE), data)
     }
 }
 
@@ -288,6 +323,10 @@ impl Drop for Ws63Algo {
         // boot's `hal_sfc_get_flash_id()` returns an unrecognized JEDEC ID and
         // flashboot reports `Flash Init Fail! ret = 0x80001341`.
         wait_cmd_done(); // ensure last SFC transaction completed
+        let _ = wait_dma_done();
+        wr(BUS_DMA_CTRL, 0);
+        wr(BUS_DMA_AHB_CTRL, self.saved_bus_dma_ahb_ctrl);
+        wr(BUS_CONFIG1, self.saved_bus_config1);
         wr(CMD_CONFIG, 0); // force-clear start / sel_cs / all fields
 
         // Issue a SPI-NOR software reset (RSTEN + RST). This clears the WREN
