@@ -51,15 +51,21 @@ const BUS_DMA_AHB_CTRL: u32 = SFC_BASE + 0x250;
 /// Flash chip offset 0 is mapped to CPU address 0x200000 (SFC bus_base_addr_cs0).
 const XIP_BASE: u32 = 0x0020_0000;
 
+// The application bulk area is 64-KiB aligned at both ends. The final 64 KiB
+// before the 0x5fc000 NV partition deliberately remains 4-KiB sectors so an
+// application update cannot erase NV. These boundaries match the vendor WS63
+// partition layout and `do_greedy_erase()` policy.
+const APP_BULK_START: u32 = 0x0023_0000;
+const APP_BULK_END: u32 = 0x005F_0000;
+
 // Standard SPI-NOR opcodes (flash_common_config.h).
 const OP_WREN: u32 = 0x06;
+const OP_WRVSR: u32 = 0x50; // volatile status-register write enable
 const OP_RDSR: u32 = 0x05;
 const OP_SE_4K: u32 = 0x20; // 4 KiB sector erase
+const OP_BE_64K: u32 = 0xD8; // 64 KiB block erase
 const OP_PP: u32 = 0x02; // page program
 const OP_WRSR: u32 = 0x01; // write status register 1
-const OP_RDSR2: u32 = 0x35; // read status register 2
-const OP_RDSR3: u32 = 0x15; // read status register 3
-const OP_WRSR3: u32 = 0x11; // write status register 3
 
 // SPI-NOR software reset sequence: RSTEN (0x66) followed by RST (0x99).
 const OP_RSTEN: u32 = 0x66; // reset enable
@@ -69,8 +75,12 @@ const RW_WRITE: u32 = 0;
 const RW_READ: u32 = 1;
 const IF_STD: u32 = 0; // standard (1-1-1) SPI
 
-/// WIP-poll budget (each iteration issues one RDSR).
-const WIP_POLL_LIMIT: u32 = 16_384;
+/// Vendor-compatible WIP polling: at most 50,000 samples separated by roughly
+/// 100 us. The interval prevents a large block erase from exhausting a tight
+/// CPU-speed loop before the NOR can finish.
+const WIP_POLL_LIMIT: u32 = 50_000;
+const WIP_POLL_INTERVAL_CYCLES: u32 = 16_000;
+const CMD_POLL_LIMIT: u32 = 50_000;
 
 /// A 64 KiB bus-DMA write can take substantially longer than one register-mode
 /// command. The host also enforces `program_time_out`; this bound only prevents
@@ -92,6 +102,54 @@ fn rd(addr: u32) -> u32 {
     unsafe { read_volatile(addr as *const u32) }
 }
 
+#[inline(always)]
+fn cycle_count() -> u32 {
+    let cycles: u32;
+    // SAFETY: reading mcycle has no side effects and is available in M-mode.
+    unsafe {
+        core::arch::asm!("csrr {cycles}, mcycle", cycles = out(reg) cycles, options(nomem, nostack));
+    }
+    cycles
+}
+
+/// Delay between RDSR samples without depending on a vendor timer service.
+///
+/// WS63 runs at no more than 160 MHz in the supported boot paths, so 16,000
+/// cycles is at least 100 us. At a lower early-boot clock the delay is longer,
+/// which is conservative for flash completion and remains bounded.
+#[inline(always)]
+fn wait_poll_interval() {
+    let start = cycle_count();
+    while cycle_count().wrapping_sub(start) < WIP_POLL_INTERVAL_CYCLES {
+        core::hint::spin_loop();
+    }
+}
+
+/// Make subsequent CPU/XIP reads observe the newly programmed flash.
+///
+/// probe-rs verifies through the CPU memory map. The WS63 caches can otherwise
+/// retain the pre-erase body and cause a false verification failure. Clean the
+/// D-cache before invalidating it because this loader's stack and state also
+/// live in SRAM, then invalidate the I-cache for the next boot path.
+#[inline(always)]
+fn flush_cpu_caches() {
+    const ICACHE_INVALIDATE_ALL: u32 = 1 << 2;
+    const DCACHE_CLEAN_INVALIDATE_ALL: u32 = (1 << 3) | (1 << 2);
+    // SAFETY: these are the WS63 cache-maintenance CSRs documented by the
+    // vendor LiteOS port. The loader executes in M-mode from SRAM.
+    unsafe {
+        core::arch::asm!(
+            "csrw 0x7c3, {dcache}",
+            "fence rw, rw",
+            "csrw 0x7c2, {icache}",
+            "fence.i",
+            dcache = in(reg) DCACHE_CLEAN_INVALIDATE_ALL,
+            icache = in(reg) ICACHE_INVALIDATE_ALL,
+            options(nostack),
+        );
+    }
+}
+
 /// Assemble `cmd_config` (bit layout from `hal_sfc_v150_regs_def.h`). `start` is
 /// always set; `sel_cs` follows the SDK (which writes 1).
 #[inline(always)]
@@ -110,21 +168,37 @@ fn cmd_config(addr_en: bool, data_en: bool, rw: u32, data_cnt: u32) -> u32 {
 /// Bounded so a routine can never spin forever (e.g. if the SFC `start` bit is
 /// never cleared); it always returns to the trampoline and halts.
 #[inline(always)]
-fn wait_cmd_done() {
+fn wait_cmd_done() -> Result<(), ErrorCode> {
     let mut n: u32 = 0;
     while rd(CMD_CONFIG) & 1 != 0 {
         n = n.wrapping_add(1);
-        if n > WIP_POLL_LIMIT {
+        if n > CMD_POLL_LIMIT {
             break;
         }
+    }
+    if n > CMD_POLL_LIMIT {
+        Err(ErrorCode::new(0x5763_0004).unwrap())
+    } else {
+        Ok(())
     }
 }
 
 /// Issue WREN (sets the flash WEL latch). Required before every erase/program.
-fn write_enable() {
+fn write_enable() -> Result<(), ErrorCode> {
     wr(CMD_INS, OP_WREN);
     wr(CMD_CONFIG, cmd_config(false, false, RW_WRITE, 0));
-    wait_cmd_done();
+    wait_cmd_done()
+}
+
+/// Enable a volatile status-register write.
+///
+/// The vendor GD25Q32 path uses 0x50 before WRSR when temporarily changing the
+/// protection bits. Unlike WREN (0x06), this does not consume a non-volatile
+/// status-register program cycle on every debug download.
+fn write_enable_volatile_status() -> Result<(), ErrorCode> {
+    wr(CMD_INS, OP_WRVSR);
+    wr(CMD_CONFIG, cmd_config(false, false, RW_WRITE, 0));
+    wait_cmd_done()
 }
 
 /// Poll RDSR until the WIP bit (status bit 0) clears.
@@ -132,23 +206,13 @@ fn wait_ready() -> Result<(), ErrorCode> {
     for _ in 0..WIP_POLL_LIMIT {
         wr(CMD_INS, OP_RDSR);
         wr(CMD_CONFIG, cmd_config(false, true, RW_READ, 0)); // read 1 status byte
-        wait_cmd_done();
+        wait_cmd_done()?;
         if rd(CMD_DATABUF) & 0x1 == 0 {
             return Ok(());
         }
+        wait_poll_interval();
     }
     Err(ErrorCode::new(0x57630001).unwrap()) // WIP wait timeout
-}
-
-/// Best-effort ready wait used after mutating flash operations.
-///
-/// On WS63 the SFC register command path can stop answering RDSR after a sector
-/// erase when entered from the vendor firmware state. The erase has already been
-/// accepted by the flash chip, but waiting forever keeps the probe-rs routine
-/// running until the debug transport times out. Bound the poll and let the host
-/// continue; later readback/verify catches a real failed erase/program.
-fn wait_ready_best_effort() {
-    let _ = wait_ready();
 }
 
 /// Program one host batch through the SFC bus-DMA engine.
@@ -162,7 +226,7 @@ fn dma_write(flash_offset: u32, data: &[u8]) -> Result<(), ErrorCode> {
         return Ok(());
     }
 
-    write_enable();
+    write_enable()?;
     wr(BUS_DMA_FLASH_SADDR, flash_offset);
     wr(BUS_DMA_MEM_SADDR, data.as_ptr() as u32);
     wr(BUS_DMA_LEN, (data.len() as u32) - 1);
@@ -184,64 +248,40 @@ fn wait_dma_done() -> Result<(), ErrorCode> {
 /// Issue a SPI-NOR software reset (RSTEN + RST).
 /// This returns the flash chip to its power-on state, clearing any lingering
 /// command/state left by the erase/program sequence.
-fn flash_software_reset() {
+fn flash_software_reset() -> Result<(), ErrorCode> {
     // RSTEN must be immediately followed by RST; do not insert WREN or other
     // commands between them.
     wr(CMD_INS, OP_RSTEN);
     wr(CMD_CONFIG, cmd_config(false, false, RW_WRITE, 0));
-    wait_cmd_done();
+    wait_cmd_done()?;
     wr(CMD_INS, OP_RST);
     wr(CMD_CONFIG, cmd_config(false, false, RW_WRITE, 0));
-    wait_cmd_done();
-    let _ = wait_ready();
+    wait_cmd_done()?;
+    wait_ready()
 }
 
 /// Read a flash status register via the given RDSR opcode. Returns 1 byte.
-fn read_status_register_op(rdsr_op: u32) -> u8 {
+fn read_status_register_op(rdsr_op: u32) -> Result<u8, ErrorCode> {
     wr(CMD_INS, rdsr_op);
     wr(CMD_CONFIG, cmd_config(false, true, RW_READ, 0)); // read 1 status byte
-    wait_cmd_done();
-    (rd(CMD_DATABUF) & 0xFF) as u8
+    wait_cmd_done()?;
+    Ok((rd(CMD_DATABUF) & 0xFF) as u8)
 }
 
-/// Write a flash status register via the given WRSR opcode. Requires WREN first.
-fn write_status_register_op(wrsr_op: u32, val: u8) {
-    write_enable();
-    wr(CMD_DATABUF + 0, val as u32);
+/// Write one status register through the volatile-write path used by the SDK.
+fn write_status_register_op_volatile(wrsr_op: u32, val: u8) -> Result<(), ErrorCode> {
+    write_enable_volatile_status()?;
+    wr(CMD_DATABUF, val as u32);
     wr(CMD_INS, wrsr_op);
-    wr(CMD_CONFIG, cmd_config(false, true, RW_WRITE, 0)); // write 1 status byte
-    wait_cmd_done();
-    let _ = wait_ready();
+    wr(CMD_CONFIG, cmd_config(false, true, RW_WRITE, 0));
+    wait_cmd_done()?;
+    wait_ready()
 }
-
-/// Write SR1 and SR2 together via WRSR (0x01). Some GD25Q32 variants only accept
-/// the two-byte form of this command; the single-byte form is ignored.
-fn write_status_registers_sr1_sr2(sr1: u8, sr2: u8) {
-    write_enable();
-    let val = ((sr2 as u32) << 8) | (sr1 as u32);
-    wr(CMD_DATABUF + 0, val);
-    wr(CMD_INS, OP_WRSR);
-    wr(CMD_CONFIG, cmd_config(false, true, RW_WRITE, 1)); // write 2 status bytes
-    wait_cmd_done();
-    let _ = wait_ready();
-}
-
-/// GD25Q32 status register values expected by flashboot's `sfc_port_fix_sr()`.
-/// SR1: BP0..BP2 (bits 2..4) = 0b111 = block protect. mask 0x9C, valid 0x1C.
-/// SR2: QE bit1=0, SUS bits clear. mask 0x43, valid 0x02.
-/// SR3: bit5=1. mask 0x61, valid 0x20.
-/// flashboot checks all three AFTER `uapi_sfc_init`, but `uapi_sfc_init` itself
-/// can fail if the flash is in a bad state. We restore all three in Drop.
-const EXPECTED_SR1: u8 = 0x1C;
-const EXPECTED_SR2: u8 = 0x02;
-const EXPECTED_SR3: u8 = 0x20;
 
 struct Ws63Algo {
-    saved_sr1: u8,
-    saved_sr2: u8,
-    saved_sr3: u8,
     saved_bus_config1: u32,
     saved_bus_dma_ahb_ctrl: u32,
+    mutating: bool,
 }
 
 algorithm!(Ws63Algo, {
@@ -258,63 +298,102 @@ algorithm!(Ws63Algo, {
     empty_value: 0xFF,
     program_time_out: 30000,
     erase_time_out: 30000,
-    sectors: [{
-        size: 0x1000,
-        address: 0x0,
-    }]
+    sectors: [
+        {
+            size: 0x1000,
+            address: 0x0,
+        },
+        {
+            size: 0x10000,
+            address: APP_BULK_START - XIP_BASE,
+        },
+        {
+            size: 0x1000,
+            address: APP_BULK_END - XIP_BASE,
+        }
+    ]
 });
 
 impl FlashAlgorithm for Ws63Algo {
-    fn new(_address: u32, _clock: u32, _function: Function) -> Result<Self, ErrorCode> {
+    fn new(_address: u32, _clock: u32, function: Function) -> Result<Self, ErrorCode> {
         // The SFC is left as configured by the boot ROM / flashboot (XIP bus mode);
         // the register/command path used below operates alongside it.
         //
-        // Save the flash status register, then clear block-protect bits (BP0..BP2)
-        // so erase/program will succeed. On this board (GD25Q32) the BP bits are
-        // set at power-on (RDSR=0x1C or 0x1E) and the chip silently rejects every
-        // erase/program until they are cleared. We restore the original SR in
-        // Drop so flashboot's `sfc_port_fix_sr()` doesn't trip on SR=0x00.
-        let saved_sr1 = read_status_register_op(OP_RDSR);
-        let saved_sr2 = read_status_register_op(OP_RDSR2);
-        let saved_sr3 = read_status_register_op(OP_RDSR3);
+        // Clear block-protect bits only for mutating operations. The volatile
+        // status-write path is reset back to the non-volatile values in Drop.
+        let mutating = matches!(function, Function::Erase | Function::Program);
         let saved_bus_config1 = rd(BUS_CONFIG1);
         let saved_bus_dma_ahb_ctrl = rd(BUS_DMA_AHB_CTRL);
 
-        // Bus-DMA uses the write operation configured in bus_config1. Do not
-        // rely on the previously-running firmware to have left this as 0x02.
-        wr(
-            BUS_CONFIG1,
-            (saved_bus_config1 & !BUS_CONFIG1_WRITE_MASK) | BUS_CONFIG1_STANDARD_PP,
-        );
-        // Clear block-protect in SR1 so erase/program will succeed.
-        write_status_register_op(OP_WRSR, 0x00);
+        if mutating {
+            // Bus-DMA uses the write operation configured in bus_config1. Do not
+            // rely on the previously-running firmware to have left this as 0x02.
+            wr(
+                BUS_CONFIG1,
+                (saved_bus_config1 & !BUS_CONFIG1_WRITE_MASK) | BUS_CONFIG1_STANDARD_PP,
+            );
+            // Clear block-protect in SR1 through the vendor's volatile
+            // status-write path. Verification is read-only and skips this.
+            write_status_register_op_volatile(OP_WRSR, 0x00)?;
+            if read_status_register_op(OP_RDSR)? & 0x7C != 0 {
+                return Err(ErrorCode::new(0x5763_0003).unwrap());
+            }
+        }
         Ok(Self {
-            saved_sr1,
-            saved_sr2,
-            saved_sr3,
             saved_bus_config1,
             saved_bus_dma_ahb_ctrl,
+            mutating,
         })
     }
 
     fn erase_sector(&mut self, address: u32) -> Result<(), ErrorCode> {
         let off = address.wrapping_sub(XIP_BASE); // CPU XIP addr -> flash offset
-        write_enable();
-        wr(CMD_INS, OP_SE_4K);
+        let opcode = if (APP_BULK_START..APP_BULK_END).contains(&address) {
+            OP_BE_64K
+        } else {
+            OP_SE_4K
+        };
+        write_enable()?;
+        wr(CMD_INS, opcode);
         wr(CMD_ADDR, off);
         wr(CMD_CONFIG, cmd_config(true, false, RW_WRITE, 0));
-        wait_cmd_done();
-        wait_ready_best_effort();
-        Ok(())
+        wait_cmd_done()?;
+        wait_ready()
     }
 
     fn program_page(&mut self, address: u32, data: &[u8]) -> Result<(), ErrorCode> {
         dma_write(address.wrapping_sub(XIP_BASE), data)
     }
+
+    fn verify(&mut self, address: u32, size: u32, data: Option<&[u8]>) -> Result<(), u32> {
+        let Some(expected) = data else {
+            return Err(address);
+        };
+        if expected.len() != size as usize {
+            return Err(address);
+        }
+
+        // The preceding program operation invalidates caches in UnInit. Repeat
+        // the maintenance here so Verify is also correct when invoked on its
+        // own after arbitrary firmware execution.
+        flush_cpu_caches();
+        for (index, expected_byte) in expected.iter().copied().enumerate() {
+            let actual = unsafe { read_volatile((address as *const u8).add(index)) };
+            if actual != expected_byte {
+                return Err(address + index as u32);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Ws63Algo {
     fn drop(&mut self) {
+        if !self.mutating {
+            flush_cpu_caches();
+            return;
+        }
+
         // Restore the SFC controller and flash chip to a clean state for
         // flashboot's `uapi_sfc_init()` on the next boot.
         //
@@ -322,7 +401,7 @@ impl Drop for Ws63Algo {
         // the last program, or with a half-finished WRSR transaction), the next
         // boot's `hal_sfc_get_flash_id()` returns an unrecognized JEDEC ID and
         // flashboot reports `Flash Init Fail! ret = 0x80001341`.
-        wait_cmd_done(); // ensure last SFC transaction completed
+        let _ = wait_cmd_done(); // ensure last SFC transaction completed
         let _ = wait_dma_done();
         wr(BUS_DMA_CTRL, 0);
         wr(BUS_DMA_AHB_CTRL, self.saved_bus_dma_ahb_ctrl);
@@ -332,36 +411,13 @@ impl Drop for Ws63Algo {
         // Issue a SPI-NOR software reset (RSTEN + RST). This clears the WREN
         // latch, any busy/half-command state, and the flash's internal command
         // state machine. RSTEN must be immediately followed by RST.
-        flash_software_reset();
+        let _ = flash_software_reset();
 
-        // Restore all three flash status registers to the values flashboot expects.
-        // GD25Q32 has SR1 (BP bits), SR2 (QE/SUS), SR3 — flashboot checks all three.
-        // BP bits in SR1 are non-volatile, so a software reset alone cannot restore
-        // them; we must use WRSR. Write SR1+SR2 together (some chips ignore the
-        // single-byte WRSR form), then SR3 separately.
-        let sr1 = if self.saved_sr1 != 0 {
-            self.saved_sr1
-        } else {
-            EXPECTED_SR1
-        };
-        let sr2 = if self.saved_sr2 != 0 {
-            self.saved_sr2
-        } else {
-            EXPECTED_SR2
-        };
-        let sr3 = if self.saved_sr3 != 0 {
-            self.saved_sr3
-        } else {
-            EXPECTED_SR3
-        };
-        write_status_registers_sr1_sr2(sr1, sr2);
-        write_status_register_op(OP_WRSR3, sr3);
-
-        // One more software reset to leave the flash in a clean, idle state; then
-        // idle the SFC command path.
-        flash_software_reset();
-        wait_cmd_done();
+        // WRVSR made the protection change volatile, so reset restores the
+        // original non-volatile status registers without another WRSR cycle.
+        let _ = wait_cmd_done();
         wr(CMD_CONFIG, 0);
         let _ = wait_ready();
+        flush_cpu_caches();
     }
 }
